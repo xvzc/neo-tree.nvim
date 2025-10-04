@@ -1,6 +1,5 @@
 local log = require("neo-tree.log")
 local utils = require("neo-tree.utils")
-local vim = vim
 local M = {}
 
 ---@type integer
@@ -33,6 +32,7 @@ M.GIT_STAGED = "NeoTreeGitStaged"
 M.GIT_UNTRACKED = "NeoTreeGitUntracked"
 M.GIT_UNSTAGED = "NeoTreeGitUnstaged"
 M.HIDDEN_BY_NAME = "NeoTreeHiddenByName"
+M.IGNORED = "NeoTreeIgnored"
 M.INDENT_MARKER = "NeoTreeIndentMarker"
 M.MESSAGE = "NeoTreeMessage"
 M.MODIFIED = "NeoTreeModified"
@@ -51,11 +51,12 @@ M.END_OF_BUFFER = "NeoTreeEndOfBuffer"
 M.ROOT_NAME = "NeoTreeRootName"
 M.SYMBOLIC_LINK_TARGET = "NeoTreeSymbolicLinkTarget"
 M.TITLE_BAR = "NeoTreeTitleBar"
-M.INDENT_MARKER = "NeoTreeIndentMarker"
 M.EXPANDER = "NeoTreeExpander"
 M.WINDOWS_HIDDEN = "NeoTreeWindowsHidden"
 M.PREVIEW = "NeoTreePreview"
 
+---@param n integer
+---@param chars integer?
 local function dec_to_hex(n, chars)
   chars = chars or 6
   local hex = string.format("%0" .. chars .. "x", n)
@@ -65,22 +66,32 @@ local function dec_to_hex(n, chars)
   return hex
 end
 
+---@param name string
+local get_hl_by_name = function(name)
+  if vim.api.nvim_get_hl then
+    local hl = vim.api.nvim_get_hl(0, { name = name })
+    ---@diagnostic disable-next-line: inject-field
+    hl.foreground = hl.fg
+    ---@diagnostic disable-next-line: inject-field
+    hl.background = hl.bg
+    return hl
+  end
+  ---TODO: remove in 4.0
+  ---@diagnostic disable-next-line: deprecated
+  return vim.api.nvim_get_hl_by_name(name, true)
+end
 ---If the given highlight group is not defined, define it.
 ---@param hl_group_name string The name of the highlight group.
----@param link_to_if_exists table A list of highlight groups to link to, in
---order of priority. The first one that exists will be used.
----@param background string|nil The background color to use, in hex, if the highlight group
---is not defined and it is not linked to another group.
----@param foreground string|nil The foreground color to use, in hex, if the highlight group
---is not defined and it is not linked to another group.
----@gui string|nil The gui to use, if the highlight group is not defined and it is not linked
---to another group.
----@return table table The highlight group values.
+---@param link_to_if_exists string[] A list of highlight groups to link to, in order of priority. The first one that exists will be used.
+---@param background string? The background color to use, in hex, if the highlight group is not defined and it is not linked to another group.
+---@param foreground string? The foreground color to use, in hex, if the highlight group is not defined and it is not linked to another group.
+---@param gui string? The gui to use, if the highlight group is not defined and it is not linked to another group.
+---@return table hlgroups The highlight group values.
 M.create_highlight_group = function(hl_group_name, link_to_if_exists, background, foreground, gui)
-  local success, hl_group = pcall(vim.api.nvim_get_hl_by_name, hl_group_name, true)
+  local success, hl_group = pcall(get_hl_by_name, hl_group_name, true)
   if not success or not hl_group.foreground or not hl_group.background then
     for _, link_to in ipairs(link_to_if_exists) do
-      success, hl_group = pcall(vim.api.nvim_get_hl_by_name, link_to, true)
+      success, hl_group = pcall(get_hl_by_name, link_to, true)
       if success then
         local new_group_has_settings = background or foreground or gui
         local link_to_has_settings = hl_group.foreground or hl_group.background
@@ -120,17 +131,19 @@ M.create_highlight_group = function(hl_group_name, link_to_if_exists, background
   return hl_group
 end
 
-local calculate_faded_highlight_group = function (hl_group_name, fade_percentage)
-  local normal = vim.api.nvim_get_hl_by_name("Normal", true)
+---@param hl_group_name string
+---@param fade_percentage number
+local calculate_faded_highlight_group = function(hl_group_name, fade_percentage)
+  local normal = get_hl_by_name("Normal")
   if type(normal.foreground) ~= "number" then
-    if vim.api.nvim_get_option("background") == "dark" then
+    if vim.go.background == "dark" then
       normal.foreground = 0xffffff
     else
       normal.foreground = 0x000000
     end
   end
   if type(normal.background) ~= "number" then
-    if vim.api.nvim_get_option("background") == "dark" then
+    if vim.go.background == "dark" then
       normal.background = 0x000000
     else
       normal.background = 0xffffff
@@ -139,7 +152,7 @@ local calculate_faded_highlight_group = function (hl_group_name, fade_percentage
   local foreground = dec_to_hex(normal.foreground)
   local background = dec_to_hex(normal.background)
 
-  local hl_group = vim.api.nvim_get_hl_by_name(hl_group_name, true)
+  local hl_group = get_hl_by_name(hl_group_name)
   if type(hl_group.foreground) == "number" then
     foreground = dec_to_hex(hl_group.foreground)
   end
@@ -160,10 +173,10 @@ local calculate_faded_highlight_group = function (hl_group_name, fade_percentage
   if hl_group.undercurl then
     table.insert(gui, "undercurl")
   end
+
+  local hl
   if #gui > 0 then
-    gui = table.concat(gui, ",")
-  else
-    gui = nil
+    hl = table.concat(gui, ",")
   end
 
   local f_red = tonumber(foreground:sub(1, 2), 16)
@@ -184,11 +197,13 @@ local calculate_faded_highlight_group = function (hl_group_name, fade_percentage
   return {
     background = hl_group.background,
     foreground = new_foreground,
-    gui = gui,
+    gui = hl,
   }
 end
 
 local faded_highlight_group_cache = {}
+---@param hl_group_name string
+---@param fade_percentage number
 M.get_faded_highlight_group = function(hl_group_name, fade_percentage)
   if type(hl_group_name) ~= "string" then
     error("hl_group_name must be a string")
@@ -211,8 +226,11 @@ M.get_faded_highlight_group = function(hl_group_name, fade_percentage)
   faded_highlight_group_cache[key] = key
   return key
 end
-
+local nvim_0_10 = vim.fn.has("nvim-0.10")
 M.setup = function()
+  local added_hl_name = nvim_0_10 and "Added" or "diffAdded"
+  local changed_hl_name = nvim_0_10 and "Changed" or "diffChanged"
+  local removed_hl_name = nvim_0_10 and "Removed" or "diffRemoved"
   -- Reset this here in case of color scheme change
   faded_highlight_group_cache = {}
 
@@ -267,11 +285,27 @@ M.setup = function()
   M.create_highlight_group(M.WINDOWS_HIDDEN, { M.DOTFILE }, nil, nil)
   M.create_highlight_group(M.PREVIEW, { "Search" }, nil, nil)
 
-  M.create_highlight_group(M.GIT_ADDED, { "GitGutterAdd", "GitSignsAdd" }, nil, "5faf5f")
-  M.create_highlight_group(M.GIT_DELETED, { "GitGutterDelete", "GitSignsDelete" }, nil, "ff5900")
-  M.create_highlight_group(M.GIT_MODIFIED, { "GitGutterChange", "GitSignsChange" }, nil, "d7af5f")
+  M.create_highlight_group(
+    M.GIT_ADDED,
+    { "GitGutterAdd", "GitSignsAdd", added_hl_name },
+    nil,
+    "5faf5f"
+  )
+  M.create_highlight_group(
+    M.GIT_DELETED,
+    { "GitGutterDelete", "GitSignsDelete", removed_hl_name },
+    nil,
+    "ff5900"
+  )
+  M.create_highlight_group(
+    M.GIT_MODIFIED,
+    { "GitGutterChange", "GitSignsChange", changed_hl_name },
+    nil,
+    "d7af5f"
+  )
   local conflict = M.create_highlight_group(M.GIT_CONFLICT, {}, nil, "ff8700", "italic,bold")
   M.create_highlight_group(M.GIT_IGNORED, { M.DOTFILE }, nil, nil)
+  M.create_highlight_group(M.IGNORED, { M.DOTFILE }, nil, nil)
   M.create_highlight_group(M.GIT_RENAMED, { M.GIT_MODIFIED }, nil, nil)
   M.create_highlight_group(M.GIT_STAGED, { M.GIT_ADDED }, nil, nil)
   M.create_highlight_group(M.GIT_UNSTAGED, { M.GIT_CONFLICT }, nil, nil)

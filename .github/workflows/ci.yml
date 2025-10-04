@@ -7,67 +7,41 @@ on:
       - v2.x
       - v3.x
   pull_request:
+  workflow_dispatch:
 
 jobs:
   stylua-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
 
       - name: Check formatting
-        uses: JohnnyMorganz/stylua-action@v2
+        uses: JohnnyMorganz/stylua-action@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          version: v0.16.0
-          args: --color always --check -g '!**/defaults.lua' lua/
+          version: latest
+          args: --color always --check lua/
 
   plenary-tests:
-    runs-on: ubuntu-20.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rev: ["0.8", "0.9", "0.10", "0.11"]
+        os: [ubuntu-22.04]
+        include:
+          - rev: "latest"
+            os: [windows-latest]
     steps:
-      - uses: actions/checkout@v2
-      - run: date +%F > todays-date
-      - name: Restore cache for today's nightly.
-        uses: actions/cache@v2
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
         with:
-          path: build
-          key: ${{ runner.os }}-appimage-${{ hashFiles('todays-date') }}
-
-      - name: Prepare
-        run: |
-          test -d build || {
-            mkdir -p build
-            wget https://github.com/neovim/neovim/releases/download/nightly/nvim.appimage
-            chmod +x nvim.appimage
-            mv nvim.appimage ./build/nvim
-          }
-
-      # - name: Get Luver Cache Key
-      #   id: luver-cache-key
-      #   env:
-      #     CI_RUNNER_OS: ${{ runner.os }}
-      #   run: |
-      #     echo "::set-output name=value::${CI_RUNNER_OS}-luver-v1-$(date -u +%Y-%m-%d)"
-      #   shell: bash
-      # - name: Setup Luver Cache
-      #   uses: actions/cache@v2
-      #   with:
-      #     path: ~/.local/share/luver
-      #     key: ${{ steps.luver-cache-key.outputs.value }}
-
-      # - name: Setup Lua
-      #   uses: MunifTanjim/luver-action@v1
-      #   with:
-      #     default: 5.1.5
-      #     lua_versions: 5.1.5
-      #     luarocks_versions: 5.1.5:3.8.0
-      # - name: Setup luacov
-      #   run: |
-      #     luarocks install luacov
-
-      - name: Run tests
-        run: |
-          export PATH="${PWD}/build/:${PATH}"
-          ./scripts/test.sh
+          install: true # [default: true] run `mise install`
+          install_args: "neovim@${{matrix.rev}}" # [default: ""] additional arguments to `mise install`
+      - run: |
+          mise use neovim@${{matrix.rev}}
+          make setup
+          make test
 
       # - name: Upload coverage to Codecov
       #   uses: codecov/codecov-action@v2

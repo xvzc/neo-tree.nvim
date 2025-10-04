@@ -11,13 +11,14 @@ M.get_repository_root = function(path, callback)
     args = { "-C", path, "rev-parse", "--show-toplevel" }
   end
   if type(callback) == "function" then
+    ---@diagnostic disable-next-line: missing-fields
     Job:new({
       command = "git",
       args = args,
       enabled_recording = true,
       on_exit = function(self, code, _)
         if code ~= 0 then
-          log.trace("GIT ROOT ERROR ", self:stderr_result())
+          log.trace("GIT ROOT ERROR", self:stderr_result())
           callback(nil)
           return
         end
@@ -32,12 +33,12 @@ M.get_repository_root = function(path, callback)
       end,
     }):start()
   else
-    local ok, git_root = utils.execute_command({ "git", unpack(args) })
+    local ok, git_output = utils.execute_command({ "git", unpack(args) })
     if not ok then
-      log.trace("GIT ROOT ERROR ", git_root)
+      log.trace("GIT ROOT ERROR", git_output)
       return nil
     end
-    git_root = git_root[1]
+    local git_root = git_output[1]
 
     if utils.is_windows then
       git_root = utils.windowize_path(git_root)

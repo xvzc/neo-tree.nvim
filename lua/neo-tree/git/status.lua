@@ -49,12 +49,21 @@ local function get_priority_git_status_code(status, other_status)
   end
 end
 
+---@class (exact) neotree.git.Context
+---@field git_status neotree.git.Status
+---@field git_root string
+---@field exclude_directories boolean
+---@field lines_parsed integer
+
+---@alias neotree.git.Status table<string, string>
+
+---@param context neotree.git.Context
 local parse_git_status_line = function(context, line)
   context.lines_parsed = context.lines_parsed + 1
   if type(line) ~= "string" then
     return
   end
-  if #line < 4 then
+  if #line < 3 then
     return
   end
   local git_root = context.git_root
@@ -114,13 +123,11 @@ local parse_git_status_line = function(context, line)
     end)
   end
 end
-
 ---Parse "git status" output for the current working directory.
 ---@base git ref base
 ---@exclude_directories boolean Whether to skip bubling up status to directories
 ---@path string Path to run the git status command in, defaults to cwd.
----@return table table Table with the path as key and the status as value.
----@return table, string|nil The git root for the specified path.
+---@return neotree.git.Status, string? git_status the neotree.Git.Status of the given root
 M.status = function(base, exclude_directories, path)
   local git_root = git_utils.get_repository_root(path)
   if not utils.truthy(git_root) then
@@ -208,11 +215,12 @@ M.status_async = function(path, base, opts)
     if utils.truthy(git_root) then
       log.trace("git.status.status_async called")
     else
-      log.trace("status_async: not a git folder: ", path)
+      log.trace("status_async: not a git folder:", path)
       return false
     end
 
     local event_id = "git_status_" .. git_root
+    ---@type neotree.git.Context
     local context = {
       git_root = git_root,
       git_status = {},
@@ -250,16 +258,17 @@ M.status_async = function(path, base, opts)
     end)
 
     utils.debounce(event_id, function()
+      ---@diagnostic disable-next-line: missing-fields
       local staged_job = Job:new({
         command = "git",
         args = { "-C", git_root, "diff", "--staged", "--name-status", base, "--" },
         enable_recording = false,
         maximium_results = context.max_lines,
-        on_stdout = vim.schedule_wrap(function(err, line, job)
+        on_stdout = function(err, line, job)
           if should_process(err, line, job, "status_async staged error:") then
             table.insert(context.lines, line)
           end
-        end),
+        end,
         on_stderr = function(err, line)
           if err and err > 0 then
             log.error("status_async staged error: ", err, line)
@@ -267,19 +276,20 @@ M.status_async = function(path, base, opts)
         end,
       })
 
+      ---@diagnostic disable-next-line: missing-fields
       local unstaged_job = Job:new({
         command = "git",
         args = { "-C", git_root, "diff", "--name-status" },
         enable_recording = false,
         maximium_results = context.max_lines,
-        on_stdout = vim.schedule_wrap(function(err, line, job)
+        on_stdout = function(err, line, job)
           if should_process(err, line, job, "status_async unstaged error:") then
             if line then
               line = " " .. line
             end
             table.insert(context.lines, line)
           end
-        end),
+        end,
         on_stderr = function(err, line)
           if err and err > 0 then
             log.error("status_async unstaged error: ", err, line)
@@ -287,19 +297,20 @@ M.status_async = function(path, base, opts)
         end,
       })
 
+      ---@diagnostic disable-next-line: missing-fields
       local untracked_job = Job:new({
         command = "git",
         args = { "-C", git_root, "ls-files", "--exclude-standard", "--others" },
         enable_recording = false,
         maximium_results = context.max_lines,
-        on_stdout = vim.schedule_wrap(function(err, line, job)
+        on_stdout = function(err, line, job)
           if should_process(err, line, job, "status_async untracked error:") then
             if line then
               line = "?	" .. line
             end
             table.insert(context.lines, line)
           end
-        end),
+        end,
         on_stderr = function(err, line)
           if err and err > 0 then
             log.error("status_async untracked error: ", err, line)
@@ -307,6 +318,7 @@ M.status_async = function(path, base, opts)
         end,
       })
 
+      ---@diagnostic disable-next-line: missing-fields
       Job:new({
         command = "git",
         args = {

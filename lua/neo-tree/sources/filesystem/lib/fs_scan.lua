@@ -1,5 +1,5 @@
 -- This files holds code for scanning the filesystem to build the tree.
-local uv = vim.loop
+local uv = vim.uv or vim.loop
 
 local renderer = require("neo-tree.ui.renderer")
 local utils = require("neo-tree.utils")
@@ -11,9 +11,15 @@ local fs_watch = require("neo-tree.sources.filesystem.lib.fs_watch")
 local git = require("neo-tree.git")
 local events = require("neo-tree.events")
 local async = require("plenary.async")
+local ignored = require("neo-tree.sources.filesystem.lib.ignored")
 
 local M = {}
 
+--- how many entries to load per readdir
+local ENTRIES_BATCH_SIZE = 1000
+
+---@param context neotree.sources.filesystem.Context
+---@param dir_path string
 local on_directory_loaded = function(context, dir_path)
   local state = context.state
   local scanned_folder = context.folders[dir_path]
@@ -37,12 +43,14 @@ local on_directory_loaded = function(context, dir_path)
         end
       end)
 
-      log.trace("Adding fs watcher for ", target_path)
+      log.trace("Adding fs watcher for", target_path)
       fs_watch.watch_folder(target_path, fs_watch_callback)
     end
   end
 end
 
+---@param context neotree.sources.filesystem.Context
+---@param dir_path string
 local dir_complete = function(context, dir_path)
   local paths_to_load = context.paths_to_load
   local folders = context.folders
@@ -54,7 +62,7 @@ local dir_complete = function(context, dir_path)
   while #paths_to_load > 0 and not next_path do
     next_path = table.remove(paths_to_load)
     -- ensure that the path is still valid
-    local success, result = pcall(vim.loop.fs_stat, next_path)
+    local success, result = pcall(uv.fs_stat, next_path)
     -- ensure that the result is a directory
     if success and result and result.type == "directory" then
       -- ensure that it is not already loaded
@@ -70,6 +78,7 @@ local dir_complete = function(context, dir_path)
   return next_path
 end
 
+---@param context neotree.sources.filesystem.Context
 local render_context = function(context)
   local state = context.state
   local root = context.root
@@ -101,13 +110,15 @@ local render_context = function(context)
   context.all_items = nil
   context.root = nil
   context.parent_id = nil
+  ---@diagnostic disable-next-line: cast-local-type
   context = nil
 end
 
-local should_check_gitignore = function (context)
+---@param context neotree.sources.filesystem.Context
+local should_check_gitignore = function(context)
   local state = context.state
   if #context.all_items == 0 then
-    log.info("No items, skipping git ignored/status lookups")
+    log.debug("No items, skipping git ignored/status lookups")
     return false
   end
   if state.search_pattern and state.check_gitignore_in_search == false then
@@ -122,6 +133,7 @@ local should_check_gitignore = function (context)
   return true
 end
 
+---@param context neotree.sources.filesystem.Context
 local job_complete_async = function(context)
   local state = context.state
   local parent_id = context.parent_id
@@ -133,7 +145,9 @@ local job_complete_async = function(context)
   --   return context
   -- end
   if should_check_gitignore(context) then
-    local mark_ignored_async = async.wrap(function (_state, _all_items, _callback)
+    local mark_ignored_async = async.wrap(function(_state, _all_items, _callback)
+      ---lua-ls can't narrow this properly
+      ---@diagnostic disable-next-line: redundant-parameter
       git.mark_ignored(_state, _all_items, _callback)
     end, 3)
     local all_items = mark_ignored_async(state, context.all_items)
@@ -144,17 +158,23 @@ local job_complete_async = function(context)
       state.git_ignored = all_items
     end
   end
+
+  ignored.mark_ignored(state, context.all_items)
   return context
 end
 
+---@param context neotree.sources.filesystem.Context
 local job_complete = function(context)
   local state = context.state
   local parent_id = context.parent_id
 
   file_nesting.nest_items(context)
 
+  ignored.mark_ignored(state, context.all_items)
   if should_check_gitignore(context) then
     if require("neo-tree").config.git_status_async then
+      ---lua-ls can't narrow this properly
+      ---@diagnostic disable-next-line: redundant-parameter
       git.mark_ignored(state, context.all_items, function(all_items)
         if parent_id then
           vim.list_extend(state.git_ignored, all_items)
@@ -181,7 +201,7 @@ local job_complete = function(context)
 end
 
 local function create_node(context, node)
-  local success3, item = pcall(file_items.create_item, context, node.path, node.type)
+  pcall(file_items.create_item, context, node.path, node.type)
 end
 
 local function process_node(context, path)
@@ -198,8 +218,9 @@ end
 
 local function get_children_sync(path)
   local children = {}
-  local dir, err = uv.fs_opendir(path, nil, 1000)
-  if err then
+  local dir, err = uv.fs_opendir(path, nil, ENTRIES_BATCH_SIZE)
+  if not dir then
+    ---@cast err -nil
     if is_permission_error(err) then
       log.debug(err)
     else
@@ -207,13 +228,18 @@ local function get_children_sync(path)
     end
     return children
   end
-  local stats = uv.fs_readdir(dir)
-  if stats then
-    for _, stat in ipairs(stats) do
+  repeat
+    local stats = uv.fs_readdir(dir)
+    if not stats then
+      break
+    end
+    local more = false
+    for i, stat in ipairs(stats) do
+      more = i == ENTRIES_BATCH_SIZE
       local child_path = utils.path_join(path, stat.name)
       table.insert(children, { path = child_path, type = stat.type })
     end
-  end
+  until not more
   uv.fs_closedir(dir)
   return children
 end
@@ -230,17 +256,27 @@ local function get_children_async(path, callback)
       callback(children)
       return
     end
-    uv.fs_readdir(dir, function(_, stats)
+    local readdir_batch
+    ---@param _ string?
+    ---@param stats uv.fs_readdir.entry[]
+    readdir_batch = function(_, stats)
       if stats then
-        for _, stat in ipairs(stats) do
+        local more = false
+        for i, stat in ipairs(stats) do
+          more = i == ENTRIES_BATCH_SIZE
           local child_path = utils.path_join(path, stat.name)
           table.insert(children, { path = child_path, type = stat.type })
+        end
+        if more then
+          return uv.fs_readdir(dir, readdir_batch)
         end
       end
       uv.fs_closedir(dir)
       callback(children)
-    end)
-  end, 1000)
+    end
+
+    uv.fs_readdir(dir, readdir_batch)
+  end, ENTRIES_BATCH_SIZE)
 end
 
 local function scan_dir_sync(context, path)
@@ -264,9 +300,9 @@ end
 
 --- async method
 local function scan_dir_async(context, path)
-  log.debug("scan_dir_async - start " .. path)
+  log.debug("scan_dir_async - start", path)
 
-  local get_children = async.wrap(function (_path, callback)
+  local get_children = async.wrap(function(_path, callback)
     return get_children_async(_path, callback)
   end, 2)
 
@@ -287,21 +323,21 @@ local function scan_dir_async(context, path)
   end
 
   process_node(context, path)
-  log.debug("scan_dir_async - finish " .. path)
+  log.debug("scan_dir_async - finish", path)
   return path
 end
 
-
 -- async_scan scans all the directories in context.paths_to_load
 -- and adds them as items to render in the UI.
+---@param context neotree.sources.filesystem.Context
 local function async_scan(context, path)
-  log.trace("async_scan: ", path)
+  log.trace("async_scan:", path)
   local scan_mode = require("neo-tree").config.filesystem.scan_mode
 
   if scan_mode == "deep" then
     local scan_tasks = {}
     for _, p in ipairs(context.paths_to_load) do
-      local scan_task = function ()
+      local scan_task = function()
         scan_dir_async(context, p)
       end
       table.insert(scan_tasks, scan_task)
@@ -326,14 +362,14 @@ local function async_scan(context, path)
 
   -- from https://github.com/nvim-lua/plenary.nvim/blob/master/lua/plenary/scandir.lua
   local function read_dir(current_dir, ctx)
-    uv.fs_opendir(current_dir, function(err, dir)
-      if err then
-        log.error(current_dir, ": ", err)
+    uv.fs_opendir(current_dir, function(openerr, dir)
+      if openerr then
+        log.error(current_dir, ": ", openerr)
         return
       end
-      local function on_fs_readdir(err, entries)
-        if err then
-          log.error(current_dir, ": ", err)
+      local function on_fs_readdir(readerr, entries)
+        if readerr then
+          log.error(current_dir, ": ", readerr)
           return
         end
         if entries then
@@ -350,7 +386,7 @@ local function async_scan(context, path)
                 table.insert(ctx.paths_to_load, item.path)
               end
             else
-              log.error("error creating item for ", path)
+              log.error("Error creating item for ", path, ":", item)
             end
           end
 
@@ -389,8 +425,10 @@ local function async_scan(context, path)
   end
 end
 
+---@param context neotree.sources.filesystem.Context
+---@param path_to_scan string
 local function sync_scan(context, path_to_scan)
-  log.trace("sync_scan: ", path_to_scan)
+  log.trace("sync_scan:", path_to_scan)
   local scan_mode = require("neo-tree").config.filesystem.scan_mode
   if scan_mode == "deep" then
     for _, path in ipairs(context.paths_to_load) do
@@ -399,25 +437,32 @@ local function sync_scan(context, path_to_scan)
     end
     job_complete(context)
   else -- scan_mode == "shallow"
-    local success, dir = pcall(vim.loop.fs_opendir, path_to_scan, nil, 1000)
-    if not success then
-      log.error("Error opening dir:", dir)
-    end
-    local success2, stats = pcall(vim.loop.fs_readdir, dir)
-    if success2 and stats then
-      for _, stat in ipairs(stats) do
-        local path = utils.path_join(path_to_scan, stat.name)
-        local success3, item = pcall(file_items.create_item, context, path, stat.type)
-        if success3 then
-          if context.recursive and stat.type == "directory" then
-            table.insert(context.paths_to_load, path)
-          end
-        else
-          log.error("error creating item for ", path)
+    local dir, err = uv.fs_opendir(path_to_scan, nil, ENTRIES_BATCH_SIZE)
+    if dir then
+      repeat
+        local stats = uv.fs_readdir(dir)
+        if not stats then
+          break
         end
-      end
+
+        local more = false
+        for i, stat in ipairs(stats) do
+          more = i == ENTRIES_BATCH_SIZE
+          local path = utils.path_join(path_to_scan, stat.name)
+          local success, item = pcall(file_items.create_item, context, path, stat.type)
+          if success then
+            if context.recursive and stat.type == "directory" then
+              table.insert(context.paths_to_load, path)
+            end
+          else
+            log.error("Error creating item for ", path, ":", item)
+          end
+        end
+      until not more
+      uv.fs_closedir(dir)
+    else
+      log.error("Error opening dir:", err)
     end
-    vim.loop.fs_closedir(dir)
 
     local next_path = dir_complete(context, path_to_scan)
     if next_path then
@@ -428,141 +473,178 @@ local function sync_scan(context, path_to_scan)
   end
 end
 
+---@param state neotree.sources.filesystem.State
+---@param parent_id string?
+---@param path_to_reveal string?
+---@param callback function
 M.get_items_sync = function(state, parent_id, path_to_reveal, callback)
-  return M.get_items(state, parent_id, path_to_reveal, callback, false)
+  M.get_items(state, parent_id, path_to_reveal, callback, false)
 end
 
+---@param state neotree.sources.filesystem.State
+---@param parent_id string?
+---@param path_to_reveal string?
+---@param callback function
 M.get_items_async = function(state, parent_id, path_to_reveal, callback)
   M.get_items(state, parent_id, path_to_reveal, callback, true)
 end
 
-local handle_search_pattern = function (context)
-    local state = context.state
-    local root = context.root
-    local search_opts = {
-      filtered_items = state.filtered_items,
-      find_command = state.find_command,
-      limit = state.search_limit or 50,
-      path = root.path,
-      term = state.search_pattern,
-      find_args = state.find_args,
-      find_by_full_path_words = state.find_by_full_path_words,
-      fuzzy_finder_mode = state.fuzzy_finder_mode,
-      on_insert = function(err, path)
-        if err then
-          log.debug(err)
-        else
-          file_items.create_item(context, path)
-        end
-      end,
-      on_exit = vim.schedule_wrap(function()
-        job_complete(context)
-      end),
-    }
-    if state.use_fzy then
-      filter_external.fzy_sort_files(search_opts, state)
-    else
-      -- Use the external command because the plenary search is slow
-      filter_external.find_files(search_opts)
-    end
+---@param context neotree.sources.filesystem.Context
+local handle_search_pattern = function(context)
+  local state = context.state
+  local root = context.root
+  local search_opts = {
+    filtered_items = state.filtered_items,
+    find_command = state.find_command,
+    limit = state.search_limit or 50,
+    path = root.path,
+    term = state.search_pattern,
+    find_args = state.find_args,
+    find_by_full_path_words = state.find_by_full_path_words,
+    fuzzy_finder_mode = state.fuzzy_finder_mode,
+    on_insert = function(err, path)
+      if err then
+        log.debug(err)
+      else
+        file_items.create_item(context, path)
+      end
+    end,
+    on_exit = vim.schedule_wrap(function()
+      job_complete(context)
+    end),
+  }
+  if state.use_fzy then
+    filter_external.fzy_sort_files(search_opts, state)
+  else
+    -- Use the external command because the plenary search is slow
+    filter_external.find_files(search_opts)
+  end
 end
 
-local handle_refresh_or_up = function (context, async)
-    local parent_id = context.parent_id
-    local path_to_reveal = context.path_to_reveal
-    local state = context.state
-    local path = parent_id or state.path
-    context.paths_to_load = {}
-    if parent_id == nil then
-      if utils.truthy(state.force_open_folders) then
-        for _, f in ipairs(state.force_open_folders) do
-          table.insert(context.paths_to_load, f)
-        end
-      elseif state.tree then
-        context.paths_to_load = renderer.get_expanded_nodes(state.tree, state.path)
+---@param context neotree.sources.filesystem.Context
+---@param async_dir_scan boolean
+local handle_refresh_or_up = function(context, async_dir_scan)
+  local parent_id = context.parent_id
+  local path_to_reveal = context.path_to_reveal
+  local state = context.state
+  local path = parent_id or state.path
+  context.paths_to_load = {}
+  if parent_id == nil then
+    if utils.truthy(state.force_open_folders) then
+      for _, f in ipairs(state.force_open_folders) do
+        table.insert(context.paths_to_load, f)
       end
-      -- Ensure parents of all expanded nodes are also scanned
-      if #context.paths_to_load > 0 and state.tree then
-        local seen = {}
-        for _, p in ipairs(context.paths_to_load) do
-          local current = p
-          while current do
-            if seen[current] then
-              break
-            end
-            seen[current] = true
-            local current_node = state.tree:get_node(current)
-            current = current_node and current_node:get_parent_id()
-          end
-        end
-        context.paths_to_load = vim.tbl_keys(seen)
-      end
-      -- Ensure that there are no nested files in the list of folders to load
-      context.paths_to_load = vim.tbl_filter(function(p)
-        local stats = vim.loop.fs_stat(p)
-        return stats and stats.type == "directory" or false
-      end, context.paths_to_load)
-      if path_to_reveal then
-        -- be sure to load all of the folders leading up to the path to reveal
-        local path_to_reveal_parts = utils.split(path_to_reveal, utils.path_separator)
-        table.remove(path_to_reveal_parts) -- remove the file name
-        -- add all parent folders to the list of paths to load
-        utils.reduce(path_to_reveal_parts, "", function(acc, part)
-          local current_path = utils.path_join(acc, part)
-          if #current_path > #path then -- within current root
-            table.insert(context.paths_to_load, current_path)
-            table.insert(state.default_expanded_nodes, current_path)
-          end
-          return current_path
-        end)
-        context.paths_to_load = utils.unique(context.paths_to_load)
-      end
+    elseif state.tree then
+      context.paths_to_load = renderer.get_expanded_nodes(state.tree, state.path)
     end
+    -- Ensure parents of all expanded nodes are also scanned
+    if #context.paths_to_load > 0 and state.tree then
+      ---@type table<string, boolean?>
+      local seen = {}
+      for _, p in ipairs(context.paths_to_load) do
+        ---@type string?
+        local current = p
+        while current do
+          if seen[current] then
+            break
+          end
+          seen[current] = true
+          local current_node = state.tree:get_node(current)
+          current = current_node and current_node:get_parent_id()
+        end
+      end
+      context.paths_to_load = vim.tbl_keys(seen)
+    end
+    -- Ensure that there are no nested files in the list of folders to load
+    context.paths_to_load = vim.tbl_filter(function(p)
+      local stats = uv.fs_stat(p)
+      return stats and stats.type == "directory" or false
+    end, context.paths_to_load)
+    if path_to_reveal then
+      -- be sure to load all of the folders leading up to the path to reveal
+      local path_to_reveal_parts = utils.split(path_to_reveal, utils.path_separator)
+      table.remove(path_to_reveal_parts) -- remove the file name
+      -- add all parent folders to the list of paths to load
+      utils.reduce(path_to_reveal_parts, utils.abspath_prefix(path_to_reveal), function(acc, part)
+        local current_path = utils.path_join(acc, part)
+        if #current_path > #path then -- within current root
+          table.insert(context.paths_to_load, current_path)
+          table.insert(state.default_expanded_nodes, current_path)
+        end
+        return current_path
+      end)
+      context.paths_to_load = utils.unique(context.paths_to_load)
+    end
+  end
 
-    local filtered_items = state.filtered_items or {}
-    context.is_a_never_show_file = function(fname)
-      if fname then
-        local _, name = utils.split_path(fname)
-        if name then
-          if filtered_items.never_show and filtered_items.never_show[name] then
-            return true
-          end
-          if utils.is_filtered_by_pattern(filtered_items.never_show_by_pattern, fname, name) then
-            return true
-          end
+  local filtered_items = state.filtered_items or {}
+  context.is_a_never_show_file = function(fname)
+    if fname then
+      local _, name = utils.split_path(fname)
+      if name then
+        if filtered_items.never_show and filtered_items.never_show[name] then
+          return true
+        end
+        if utils.is_filtered_by_pattern(filtered_items.never_show_by_pattern, fname, name) then
+          return true
         end
       end
-      return false
     end
-    table.insert(context.paths_to_load, path)
-    if async then
-      async_scan(context, path)
-    else
-      sync_scan(context, path)
-    end
+    return false
+  end
+  table.insert(context.paths_to_load, path)
+  if async_dir_scan then
+    async_scan(context, path)
+  else
+    sync_scan(context, path)
+  end
 end
 
-M.get_items = function(state, parent_id, path_to_reveal, callback, async, recursive) 
+---@class neotree.sources.filesystem.Context : neotree.FileItemContext
+---@field state neotree.sources.filesystem.State
+---@field recursive boolean?
+---@field parent_id string?
+---@field callback function?
+---@field async boolean?
+---@field root neotree.FileItem.Directory|neotree.FileItem.Link
+---@field directories_scanned integer?
+---@field directories_to_scan integer?
+---@field on_exit function?
+---async
+---@field paths_to_load string[]
+---@field is_a_never_show_file fun(filename: string?):boolean
+
+---@class neotree.sources.filesystem.State : neotree.StateWithTree, neotree.Config.Filesystem
+---@field git_ignored neotree.FileItem[]
+---@field path string
+
+---@param state neotree.sources.filesystem.State
+---@param parent_id string?
+---@param callback function?
+---@param async_dir_scan boolean?
+---@param recursive boolean?
+M.get_items = function(state, parent_id, path_to_reveal, callback, async_dir_scan, recursive)
   renderer.acquire_window(state)
   if state.async_directory_scan == "always" then
-    async = true
+    async_dir_scan = true
   elseif state.async_directory_scan == "never" then
-    async = false
-  elseif type(async) == "nil" then
-    async = (state.async_directory_scan == "auto") or state.async_directory_scan
+    async_dir_scan = false
+  elseif type(async_dir_scan) == "nil" then
+    async_dir_scan = (state.async_directory_scan == "auto") or state.async_directory_scan ~= nil
   end
 
   if not parent_id then
     M.stop_watchers(state)
   end
-  local context = file_items.create_context()
+  ---@type neotree.sources.filesystem.Context
+  local context = file_items.create_context() --[[@as neotree.sources.filesystem.Context]]
   context.state = state
   context.parent_id = parent_id
   context.path_to_reveal = path_to_reveal
   context.recursive = recursive
   context.callback = callback
   -- Create root folder
-  local root = file_items.create_item(context, parent_id or state.path, "directory")
+  local root = file_items.create_item(context, parent_id or state.path, "directory") --[[@as neotree.FileItem.Directory]]
   root.name = vim.fn.fnamemodify(root.path, ":~")
   root.loaded = true
   root.search_pattern = state.search_pattern
@@ -575,13 +657,15 @@ M.get_items = function(state, parent_id, path_to_reveal, callback, async, recurs
   else
     -- In the case of a refresh or navigating up, we need to make sure that all
     -- open folders are loaded.
-    handle_refresh_or_up(context, async)
+    handle_refresh_or_up(context, async_dir_scan)
   end
 end
 
--- async method
+---@param state neotree.sources.filesystem.State
+---@param parent_id string
+---@param recursive boolean?
 M.get_dir_items_async = function(state, parent_id, recursive)
-  local context = file_items.create_context()
+  local context = file_items.create_context() --[[@as neotree.sources.filesystem.Context]]
   context.state = state
   context.parent_id = parent_id
   context.path_to_reveal = nil
@@ -590,7 +674,7 @@ M.get_dir_items_async = function(state, parent_id, recursive)
   context.paths_to_load = {}
 
   -- Create root folder
-  local root = file_items.create_item(context, parent_id or state.path, "directory")
+  local root = file_items.create_item(context, parent_id or state.path, "directory") --[[@as neotree.FileItem.Directory]]
   root.name = vim.fn.fnamemodify(root.path, ":~")
   root.loaded = true
   root.search_pattern = state.search_pattern
@@ -614,27 +698,28 @@ M.get_dir_items_async = function(state, parent_id, recursive)
     return false
   end
   table.insert(context.paths_to_load, parent_id)
- 
+
   local scan_tasks = {}
   for _, p in ipairs(context.paths_to_load) do
-     local scan_task = function ()
-       scan_dir_async(context, p)
-     end
-     table.insert(scan_tasks, scan_task)
+    local scan_task = function()
+      scan_dir_async(context, p)
+    end
+    table.insert(scan_tasks, scan_task)
   end
   async.util.join(scan_tasks)
 
   job_complete_async(context)
 
-  local finalize =  async.wrap(function (_context, _callback)
-    vim.schedule(function ()
-        render_context(_context)
-        _callback()
+  local finalize = async.wrap(function(_context, _callback)
+    vim.schedule(function()
+      render_context(_context)
+      _callback()
     end)
   end, 2)
   finalize(context)
 end
 
+---@param state neotree.sources.filesystem.State
 M.stop_watchers = function(state)
   if state.use_libuv_file_watcher and state.tree then
     -- We are loaded a new root or refreshing, unwatch any folders that were
@@ -644,7 +729,7 @@ M.stop_watchers = function(state)
     end)
     fs_watch.unwatch_git_index(state.path, require("neo-tree").config.git_status_async)
     for _, folder in ipairs(loaded_folders) do
-      log.trace("Unwatching folder ", folder.path)
+      log.trace("Unwatching folder", folder.path)
       if folder.is_link then
         fs_watch.unwatch_folder(folder.link_to)
       else
@@ -653,9 +738,9 @@ M.stop_watchers = function(state)
     end
   else
     log.debug(
-      "Not unwatching folders... use_libuv_file_watcher is ",
+      "Not unwatching folders... use_libuv_file_watcher is",
       state.use_libuv_file_watcher,
-      " and state.tree is ",
+      " and state.tree is",
       utils.truthy(state.tree)
     )
   end
